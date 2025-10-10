@@ -152,8 +152,8 @@ def download_with_progress_queue(url: str, output_dir: str, progress_queue, song
                 update_skipped_file()
                 
                 # Skip processing our own WebSocket logging messages to avoid feedback loop
-                if line.startswith("WebSocket"):
-                    original_print(*args, **kwargs)
+                if line.startswith("WebSocket") or "WebSocket" in line or line.startswith("♦"):
+                    # Suppress WebSocket debug messages for cleaner output
                     return
                 
                 # Check for "Already exists" messages first
@@ -179,15 +179,35 @@ def download_with_progress_queue(url: str, output_dir: str, progress_queue, song
                             current_idx, total_songs, song_name, status = match.groups()
                             
                             # Find matching song data to get song_id
+                            # NOTE: current_idx is the processing order, not playlist order
+                            # We need to find the song by name since backend skips already downloaded songs
                             song_id = f"song_{current_idx}"
                             artist = "Unknown Artist"
                             
-                            # Try to find the song in our songs_data
+                            # Try to find the song in our songs_data by name matching
+                            best_match_song = None
+                            best_match_score = 0
+                            
                             for song in songs_data:
-                                if song.get('name', '').lower().strip() in song_name.lower() or song_name.lower().strip() in song.get('name', '').lower():
-                                    song_id = song.get('song_id', song_id)
-                                    artist = song.get('artist', artist)
+                                song_name_clean = song.get('name', '').lower().strip()
+                                backend_name_clean = song_name.lower().strip()
+                                
+                                # Calculate match score (higher = better match)
+                                if song_name_clean == backend_name_clean:
+                                    # Perfect match
+                                    best_match_song = song
+                                    best_match_score = 100
                                     break
+                                elif song_name_clean in backend_name_clean or backend_name_clean in song_name_clean:
+                                    # Partial match
+                                    match_score = min(len(song_name_clean), len(backend_name_clean)) / max(len(song_name_clean), len(backend_name_clean)) * 50
+                                    if match_score > best_match_score:
+                                        best_match_song = song
+                                        best_match_score = match_score
+                            
+                            if best_match_song:
+                                song_id = best_match_song.get('song_id', song_id)
+                                artist = best_match_song.get('artist', artist)
                             
                             # Check if this song was marked as already existing
                             song_already_exists = any(existing_name in song_name for existing_name in existing_songs)
@@ -335,15 +355,15 @@ def download_with_progress_queue(url: str, output_dir: str, progress_queue, song
                     song_id = None
                     download_name = web_data["song_name"].lower().strip()
                     
-                    # First try: Use current_index to directly map to song if available and valid
-                    if web_data.get("current_index", 0) > 0 and len(songs_data) >= web_data["current_index"]:
-                        try:
-                            # current_index is 1-based, so subtract 1 for 0-based array access
-                            direct_song = songs_data[web_data["current_index"] - 1]
-                            song_id = direct_song["song_id"]
-                            print(f"Debug: Direct index match for {download_name} -> {song_id}")
-                        except (IndexError, KeyError):
-                            pass  # Fall back to fuzzy matching
+                    # NOTE: Don't use current_index for direct mapping because backend processing order
+                    # differs from playlist order when songs are skipped. Use name matching instead.
+                    # 
+                    # First try: Find by exact name match
+                    for song in songs_data:
+                        if song["name"].lower().strip() == download_name:
+                            song_id = song["song_id"]
+                            # Suppressed debug output for cleaner logs
+                            break
                     
                     # Initialize variables before fuzzy matching
                     download_artist = ""
@@ -416,19 +436,10 @@ def download_with_progress_queue(url: str, output_dir: str, progress_queue, song
                     elif web_data["status"] == "error":
                         individual_progress = 0    # Error - no progress
                     
-                    # If we still don't have a song_id, try one more approach using position-based matching
-                    if not song_id and web_data.get("current_index", 0) > 0:
-                        # Try to find song by position in the original order
-                        try:
-                            position_song = songs_data[web_data["current_index"] - 1]
-                            # Simple name similarity check
-                            frontend_name = position_song["name"].lower().replace(" ", "").replace("-", "")
-                            download_name_clean = download_name.replace(" ", "").replace("-", "")
-                            if frontend_name in download_name_clean or download_name_clean in frontend_name:
-                                song_id = position_song["song_id"]
-                                print(f"Debug: Position-based match for {download_name} -> {song_id}")
-                        except (IndexError, KeyError):
-                            pass
+                    # If we still don't have a song_id, create a fallback ID but warn about it
+                    if not song_id:
+                        song_id = f"unknown_song_{web_data.get('current_index', 0)}"
+                        print(f"Warning: Could not match song '{download_name}' to UI - creating fallback ID: {song_id}")
                     
                     # Send progress update with immediate processing for skipped songs
                     progress_data = {
@@ -1136,17 +1147,17 @@ async def cancel_song(request: dict):
             
             logger.info(f"Skipping: {song_info['name']} - {song_info['artist']}")
         
-        # Send cancellation message via WebSocket to hide this song from UI
+        # Send cancellation message via WebSocket to update UI immediately
         if client_id in websocket_connections:
             await websocket_connections[client_id].send_text(json.dumps({
                 "song": {"song_id": song_id},
                 "progress": 0,
                 "status": "cancelled",
-                "message": "Skipped"
+                "message": "Removed from queue"
             }))
             
 
-            return JSONResponse(content={"status": "cancelled", "message": "Song skipped"})
+            return JSONResponse(content={"status": "cancelled", "message": "Song removed from queue"})
             
     except Exception as e:
         logger.error(f"Error cancelling individual song: {e}")
@@ -1724,6 +1735,13 @@ async def get_main_page():
             transform: scale(1.1);
         }
         
+        .delete-btn.disabled {
+            background: rgba(128, 128, 128, 0.3);
+            cursor: not-allowed;
+            opacity: 0.3;
+            pointer-events: none;
+        }
+        
         .status-completed {
             background: rgba(39, 174, 96, 0.2);
             border-left: 4px solid #27ae60;
@@ -2287,6 +2305,9 @@ async def get_main_page():
             }
             
             if (progressFill && progressText && songCard) {
+                // Find the delete button for this song
+                const deleteBtn = songCard.querySelector('.delete-btn');
+                
                 // Update status and styling based on download state
                 songCard.className = 'song-card';
                 
@@ -2294,12 +2315,22 @@ async def get_main_page():
                     songCard.classList.add('status-downloading');
                     progressText.textContent = 'Downloading...';
                     
+                    // Disable the X button during download
+                    if (deleteBtn) {
+                        deleteBtn.classList.add('disabled');
+                    }
+                    
                     // Start the incremental progress animation
                     startProgressAnimation(songId);
                     
                 } else if (data.status === 'processing') {
                     songCard.classList.add('status-downloading');
                     progressText.textContent = 'Processing...';
+                    
+                    // Disable the X button during processing
+                    if (deleteBtn) {
+                        deleteBtn.classList.add('disabled');
+                    }
                     
                     // Continue animation if it was already started
                     if (!progressAnimations.has(songId)) {
@@ -2309,6 +2340,11 @@ async def get_main_page():
                 } else if (data.status === 'success' || data.status === 'completed') {
                     songCard.classList.add('status-completed');
                     progressText.textContent = 'Download completed';
+                    
+                    // Re-enable the X button (for manual deletion)
+                    if (deleteBtn) {
+                        deleteBtn.classList.remove('disabled');
+                    }
                     
                     // Complete the animation (jump to 100%)
                     completeProgressAnimation(songId);
@@ -2323,6 +2359,11 @@ async def get_main_page():
                 } else if (data.status === 'exists') {
                     songCard.classList.add('status-completed');
                     progressText.textContent = 'Already downloaded';
+                    
+                    // Re-enable the X button (for manual deletion)
+                    if (deleteBtn) {
+                        deleteBtn.classList.remove('disabled');
+                    }
                     
                     // Immediately set to 100% for existing files
                     progressFill.style.width = '100%';
@@ -2341,6 +2382,11 @@ async def get_main_page():
                 } else if (data.status === 'error') {
                     songCard.classList.add('status-error');
                     progressText.textContent = 'Download failed';
+                    
+                    // Re-enable the X button (failed songs can be removed from list)
+                    if (deleteBtn) {
+                        deleteBtn.classList.remove('disabled');
+                    }
                     
                     // Stop any running animation
                     stopProgressAnimation(songId);

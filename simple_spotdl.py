@@ -853,10 +853,16 @@ def download_songs(songs: List[dict], output_dir: str, playlist_name: str) -> bo
                                 error_msg = "Unknown error"
                             
                             if success:
-                                successful += 1
-                                # Send web progress: Song completed
-                                send_web_progress("completed", song_name, current_index, total_songs, "Download completed")
-                                break
+                                # Check if song was cancelled AFTER download completed
+                                if is_song_skipped(song_name, artist_name):
+                                    send_web_progress("cancelled", song_name, current_index, total_songs, "Cancelled (download completed)")
+                                    # File stays on disk - user can delete manually if needed
+                                    break  # Don't count as successful
+                                else:
+                                    successful += 1
+                                    # Send web progress: Song completed
+                                    send_web_progress("completed", song_name, current_index, total_songs, "Download completed")
+                                    break
                             else:
                                 retry_count += 1
                                 if retry_count < max_retries:
